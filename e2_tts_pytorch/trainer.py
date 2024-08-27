@@ -80,7 +80,8 @@ class HFDataset(Dataset):
         self,
         hf_dataset: Dataset,
         target_sample_rate = 24_000,
-        hop_length = 256
+        hop_length = 256,
+        phoneme_replacement_rate = 0.0
     ):
         self.data = hf_dataset
         self.target_sample_rate = target_sample_rate

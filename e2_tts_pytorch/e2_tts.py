@@ -89,6 +89,7 @@ def get_g2p_en_encode():
     ) -> Int['b nt']:
 
         phonemes = [g2p(t) for t in text]
+        print(phonemes)
         list_tensors = [tensor([g2p.p2idx[p] for p in one_phoneme]) for one_phoneme in phonemes]
         padded_tensor = pad_sequence(list_tensors, padding_value = -1, batch_first = True)
         return padded_tensor
