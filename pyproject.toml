@@ -32,6 +32,7 @@ dependencies = [
     'g2p-en',
     'jaxtyping',
     'loguru',
+    'scipy',
     'tensorboard',
     'torch>=2.0',
     'torchdiffeq',
@@ -39,7 +40,10 @@ dependencies = [
     'tqdm>=4.65.0',
     'vocos',
     'x-transformers>=1.31.14',
-    "distributed-shampoo",
+    'matplotlib>=3.7.5',
+    'datasets>=2.21.0',
+    'distributed-shampoo',
+    'librosa>=0.10.2.post1',
 ]
 
 [project.urls]
@@ -60,4 +64,5 @@ allow-direct-references = true
 packages = ["e2_tts_pytorch"]
 
 [tool.uv.sources]
-distributed-shampoo = { git = "https://github.com/facebookresearch/optimizers.git" }
+distributed-shampoo = { path = "./optimizers", editable = true }
+accelerate = { path = "./accelerate", editable = true }
