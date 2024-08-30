@@ -24,7 +24,7 @@ classifiers=[
   ]
 
 dependencies = [
-    'accelerate>=0.33.0',
+    "accelerate>=0.33.0",
     'einops>=0.8.0',
     'einx>=0.3.0',
     'ema-pytorch>=0.5.2',
@@ -33,13 +33,16 @@ dependencies = [
     'jaxtyping',
     'loguru',
     'scipy',
-    'tensorboard',
+    "tensorboard",
     'torch>=2.0',
     'torchdiffeq',
     'torchaudio>=2.3.1',
     'tqdm>=4.65.0',
     'x-transformers>=1.31.14',
+    "matplotlib>=3.7.5",
+    "datasets>=2.21.0",
     "distributed-shampoo",
+    "librosa>=0.10.2.post1",
 ]
 
 [project.urls]
@@ -60,4 +63,5 @@ allow-direct-references = true
 packages = ["e2_tts_pytorch"]
 
 [tool.uv.sources]
-distributed-shampoo = { git = "https://github.com/facebookresearch/optimizers.git" }
+distributed-shampoo = { path = "./optimizers", editable = true }
+accelerate = { path = "./accelerate", editable = true }

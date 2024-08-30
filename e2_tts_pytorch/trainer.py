@@ -19,6 +19,10 @@ from einops import rearrange
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
+from distributed_shampoo.distributed_shampoo import DistributedShampoo
+from distributed_shampoo.shampoo_types import AdamGraftingConfig, DDPShampooConfig, CommunicationDType
+import torch.distributed.checkpoint as dist_checkpoint
+
 from ema_pytorch import EMA
 
 from loguru import logger
@@ -139,9 +143,12 @@ class E2Trainer:
         sample_rate = 22050,
         tensorboard_log_dir = 'runs/e2_tts_experiment',
         accelerate_kwargs: dict = dict(),
-        ema_kwargs: dict = dict()
+        ema_kwargs: dict = dict(),
+        use_shampoo = False
     ):
         logger.add(log_file)
+
+        self.use_shampoo = use_shampoo
 
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters = True)
 
@@ -166,14 +173,39 @@ class E2Trainer:
             self.ema_model.to(self.accelerator.device)
 
         self.duration_predictor = duration_predictor
-        self.optimizer = optimizer
+
+
+
         self.num_warmup_steps = num_warmup_steps
         self.checkpoint_path = default(checkpoint_path, 'model.pth')
         self.mel_spectrogram = MelSpec(sampling_rate=self.target_sample_rate)
-
-        self.model, self.optimizer = self.accelerator.prepare(
-            self.model, self.optimizer
-        )
+        if self.use_shampoo:
+            self.model = self.accelerator.prepare_model(self.model)
+            optimizer = DistributedShampoo(
+                model.parameters(),
+                lr=0.001,
+                betas=(0.9, 0.999),
+                epsilon=1e-12,
+                weight_decay=1e-05,
+                max_preconditioner_dim=8192,
+                precondition_frequency=100,
+                use_decoupled_weight_decay=True,
+                grafting_config=AdamGraftingConfig(
+                    beta2=0.999,
+                    epsilon=1e-12,
+                ),
+                distributed_config=DDPShampooConfig(
+                    communication_dtype=CommunicationDType.BF16,
+                    num_trainers_per_group=2,
+                    communicate_params=True,
+                ),
+            )
+            self.optimizer = self.accelerator.prepare(optimizer)
+        else:
+            self.optimizer = optimizer
+            self.model, self.optimizer = self.accelerator.prepare(
+                self.model, self.optimizer
+            )
         self.max_grad_norm = max_grad_norm
         
         self.writer = SummaryWriter(log_dir=tensorboard_log_dir)
@@ -184,24 +216,56 @@ class E2Trainer:
 
     def save_checkpoint(self, step, finetune=False):
         self.accelerator.wait_for_everyone()
-        if self.is_main:
-            checkpoint = dict(
-                model_state_dict = self.accelerator.unwrap_model(self.model).state_dict(),
-                optimizer_state_dict = self.accelerator.unwrap_model(self.optimizer).state_dict(),
-                ema_model_state_dict = self.ema_model.state_dict(),
-                scheduler_state_dict = self.scheduler.state_dict(),
-                step = step
-            )
-
-            self.accelerator.save(checkpoint, self.checkpoint_path)
+        if self.is_main or True:
+            if self.use_shampoo:
+                if self.is_main:
+                    checkpoint = dict(
+                        model_state_dict = self.accelerator.unwrap_model(self.model).state_dict(),
+                        optimizer_state_dict = self.accelerator.unwrap_model(self.optimizer).distributed_state_dict(key_to_param=self.model.named_parameters()),
+                        ema_model_state_dict = self.ema_model.state_dict(),
+                        scheduler_state_dict = self.scheduler.state_dict(),
+                        step = step
+                    )
+                else:
+                    checkpoint = dict(
+                        model_state_dict = self.accelerator.unwrap_model(self.model).state_dict(),
+                        optimizer_state_dict = self.accelerator.unwrap_model(self.optimizer).distributed_state_dict(key_to_param=self.model.named_parameters()),
+                        scheduler_state_dict = self.scheduler.state_dict(),
+                        step = step
+                    )
+                print("Checkpoint Unwrapped")
+                dist_checkpoint.save_state_dict(
+                    state_dict=checkpoint,
+                    storage_writer=dist_checkpoint.FileSystemWriter(self.checkpoint_path),
+                )
+                print("Checkpoint Saved")
+                # self.accelerator.save(checkpoint, self.checkpoint_path)
+            else:
+                checkpoint = dict(
+                    model_state_dict = self.accelerator.unwrap_model(self.model).state_dict(),
+                    optimizer_state_dict = self.accelerator.unwrap_model(self.optimizer).state_dict(),
+                    ema_model_state_dict = self.ema_model.state_dict(),
+                    scheduler_state_dict = self.scheduler.state_dict(),
+                    step = step
+                )
+                self.accelerator.save(checkpoint, self.checkpoint_path)
+        self.accelerator.wait_for_everyone()
 
     def load_checkpoint(self):
         if not exists(self.checkpoint_path) or not os.path.exists(self.checkpoint_path):
             return 0
-
-        checkpoint = torch.load(self.checkpoint_path)
-        self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint['model_state_dict'])
-        self.accelerator.unwrap_model(self.optimizer).load_state_dict(checkpoint['optimizer_state_dict'])
+        if self.use_shampoo:
+            checkpoint = {}
+            dist_checkpoint.load_state_dict(
+                state_dict=checkpoint,
+                storage_reader=dist_checkpoint.FileSystemReader(self.checkpoint_path),
+            )
+            self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_distributed_state_dict(checkpoint["optimizer_state_dict"], key_to_param=self.model.named_parameters())
+        else:
+            checkpoint = torch.load(self.checkpoint_path)
+            self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint['model_state_dict'])
+            self.accelerator.unwrap_model(self.optimizer).load_state_dict(checkpoint['optimizer_state_dict'])
 
         if self.is_main:
             self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
@@ -248,6 +312,8 @@ class E2Trainer:
                     self.optimizer.step()
                     self.scheduler.step()
                     self.optimizer.zero_grad()
+
+                self.accelerator.wait_for_everyone()
 
                 if self.is_main:
                     self.ema_model.update()

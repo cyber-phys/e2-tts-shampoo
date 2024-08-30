@@ -1,0 +1,6 @@
+[submodule "optimizers"]
+	path = optimizers
+	url = https://github.com/facebookresearch/optimizers.git
+[submodule "accelerate"]
+	path = accelerate
+	url = https://github.com/huggingface/accelerate.git
