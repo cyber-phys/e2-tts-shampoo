@@ -1,5 +1,15 @@
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+
 from __future__ import annotations
 
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import os
 from tqdm import tqdm
 import matplotlib
@@ -35,7 +45,7 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
-# plot spectrogram 
+# plot spectrogram
 def plot_spectrogram(spectrogram):
     fig, ax = plt.subplots(figsize=(10, 4))
     im = ax.imshow(spectrogram.T, aspect="auto", origin="lower", interpolation="none")
@@ -60,7 +70,7 @@ def collate_fn(batch):
         padding = (0, max_mel_length - spec.size(-1))
         padded_spec = F.pad(spec, padding, value = 0)
         padded_mel_specs.append(padded_spec)
-    
+
     mel_specs = torch.stack(padded_mel_specs)
 
     text = [item['text'] for item in batch]
@@ -89,7 +99,7 @@ class HFDataset(Dataset):
 
     def __len__(self):
         return len(self.data)
-    
+
     def __getitem__(self, index):
         row = self.data[index]
         audio = row['audio']['array']
@@ -102,27 +112,45 @@ class HFDataset(Dataset):
         if duration > 20 or duration < 0.3:
             logger.warning(f"Skipping due to duration out of bound: {duration}")
             return self.__getitem__((index + 1) % len(self.data))
-        
+
         audio_tensor = torch.from_numpy(audio).float()
-        
+
         if sample_rate != self.target_sample_rate:
             resampler = torchaudio.transforms.Resample(sample_rate, self.target_sample_rate)
             audio_tensor = resampler(audio_tensor)
-        
+
         audio_tensor = rearrange(audio_tensor, 't -> 1 t')
-        
+
         mel_spec = self.mel_spectrogram(audio_tensor)
-        
+
         mel_spec = rearrange(mel_spec, '1 d t -> d t')
-        
+
         text = row['transcript']
-        
+
         return dict(
             mel_spec = mel_spec,
             text = text,
         )
 
 # trainer
+
+def setup_distributed():
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ['WORLD_SIZE'])
+        gpu = int(os.environ['LOCAL_RANK'])
+    elif 'SLURM_PROCID' in os.environ:
+        rank = int(os.environ['SLURM_PROCID'])
+        world_size = int(os.environ['SLURM_NTASKS'])
+        gpu = rank % torch.cuda.device_count()
+    else:
+        logger.info('Not using distributed mode')
+        return
+
+    torch.cuda.set_device(gpu)
+    dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
+    dist.barrier()
+    logger.info(f'Distributed setup complete. Rank: {rank}, World Size: {world_size}, GPU: {gpu}')
 
 class E2Trainer:
     def __init__(
@@ -137,23 +165,17 @@ class E2Trainer:
         max_grad_norm = 1.0,
         sample_rate = 22050,
         tensorboard_log_dir = 'runs/e2_tts_experiment',
-        accelerate_kwargs: dict = dict(),
         ema_kwargs: dict = dict()
     ):
         logger.add(log_file)
 
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters = True)
+        setup_distributed()
 
-        self.accelerator = Accelerator(
-            log_with = "all",
-            kwargs_handlers = [ddp_kwargs],
-            gradient_accumulation_steps = grad_accumulation_steps,
-            **accelerate_kwargs
-        )
+        self.device = torch.device(f'cuda:{dist.get_rank()}')
+        self.model = model.to(self.device)
+        self.model = DDP(self.model, device_ids=[dist.get_rank()])
 
-        self.target_sample_rate = sample_rate
-
-        self.model = model
+        self.is_main = dist.get_rank() == 0
 
         if self.is_main:
             self.ema_model = EMA(
@@ -162,113 +184,115 @@ class E2Trainer:
                 **ema_kwargs
             )
 
-            self.ema_model.to(self.accelerator.device)
+            self.ema_model.to(self.device)
 
+        self.target_sample_rate = sample_rate
         self.duration_predictor = duration_predictor
         self.optimizer = optimizer
         self.num_warmup_steps = num_warmup_steps
         self.checkpoint_path = default(checkpoint_path, 'model.pth')
         self.mel_spectrogram = MelSpec(sampling_rate=self.target_sample_rate)
 
-        self.model, self.optimizer = self.accelerator.prepare(
-            self.model, self.optimizer
-        )
         self.max_grad_norm = max_grad_norm
-        
-        self.writer = SummaryWriter(log_dir=tensorboard_log_dir)
 
-    @property
-    def is_main(self):
-        return self.accelerator.is_main_process
-
-    def save_checkpoint(self, step, finetune=False):
-        self.accelerator.wait_for_everyone()
         if self.is_main:
-            checkpoint = dict(
-                model_state_dict = self.accelerator.unwrap_model(self.model).state_dict(),
-                optimizer_state_dict = self.accelerator.unwrap_model(self.optimizer).state_dict(),
-                ema_model_state_dict = self.ema_model.state_dict(),
-                scheduler_state_dict = self.scheduler.state_dict(),
-                step = step
-            )
+            self.writer = SummaryWriter(log_dir=tensorboard_log_dir)
 
-            self.accelerator.save(checkpoint, self.checkpoint_path)
+    def save_checkpoint(self, step,finetune=False):
+           dist.barrier()
+           if self.is_main:
+               checkpoint = dict(
+                   model_state_dict = self.model.module.state_dict(),
+                   optimizer_state_dict = self.optimizer.state_dict(),
+                   ema_model_state_dict = self.ema_model.state_dict(),
+                   scheduler_state_dict = self.scheduler.state_dict(),
+                   step = step
+               )
+
+               torch.save(checkpoint, self.checkpoint_path)
+           dist.barrier()
 
     def load_checkpoint(self):
         if not exists(self.checkpoint_path) or not os.path.exists(self.checkpoint_path):
             return 0
 
-        checkpoint = torch.load(self.checkpoint_path)
-        self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint['model_state_dict'])
-        self.accelerator.unwrap_model(self.optimizer).load_state_dict(checkpoint['optimizer_state_dict'])
+        map_location = {'cuda:%d' % 0: 'cuda:%d' % dist.get_rank()}
+        checkpoint = torch.load(self.checkpoint_path, map_location=map_location)
+        self.model.module.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
         if self.is_main:
             self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
 
         if self.scheduler:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        dist.barrier()
         return checkpoint['step']
 
     def train(self, train_dataset, epochs, batch_size, num_workers=12, save_step=1000):
-
-        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=True, num_workers=num_workers, pin_memory=True)
+        train_sampler = DistributedSampler(train_dataset)
+        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=collate_fn, sampler=train_sampler, num_workers=num_workers, pin_memory=True)
         total_steps = len(train_dataloader) * epochs
         decay_steps = total_steps - self.num_warmup_steps
         warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=self.num_warmup_steps)
         decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_steps)
-        self.scheduler = SequentialLR(self.optimizer, 
+        self.scheduler = SequentialLR(self.optimizer,
                                       schedulers=[warmup_scheduler, decay_scheduler],
                                       milestones=[self.num_warmup_steps])
-        train_dataloader, self.scheduler = self.accelerator.prepare(train_dataloader, self.scheduler)
         start_step = self.load_checkpoint()
         global_step = start_step
 
         for epoch in range(epochs):
+            train_sampler.set_epoch(epoch)
             self.model.train()
-            progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}", unit="step", disable=not self.accelerator.is_local_main_process)
+            progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}", unit="step", disable=not self.is_main)
             epoch_loss = 0.0
 
             for batch in progress_bar:
-                with self.accelerator.accumulate(self.model):
-                    text_inputs = batch['text']
-                    mel_spec = rearrange(batch['mel'], 'b d n -> b n d')
-                    mel_lengths = batch["mel_lengths"]
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                text_inputs = batch['text']
+                mel_spec = rearrange(batch['mel'], 'b d n -> b n d')
+                mel_lengths = batch["mel_lengths"]
 
-                    if self.duration_predictor is not None:
-                        dur_loss = self.duration_predictor(mel_spec, lens=batch.get('durations'))
+                if self.duration_predictor is not None:
+                    dur_loss = self.duration_predictor(mel_spec, lens=batch.get('durations'))
+                    if self.is_main:
                         self.writer.add_scalar('duration loss', dur_loss.item(), global_step)
 
-                    loss, cond, pred = self.model(mel_spec, text=text_inputs, lens=mel_lengths)
-                    self.accelerator.backward(loss)
+                loss, cond, pred = self.model(mel_spec, text=text_inputs, lens=mel_lengths)
+                loss = loss.mean()  # Average loss across GPUs
+                loss.backward()
 
-                    if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                if self.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-                    self.optimizer.step()
-                    self.scheduler.step()
-                    self.optimizer.zero_grad()
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
 
                 if self.is_main:
                     self.ema_model.update()
 
-                if self.accelerator.is_local_main_process:
                     logger.info(f"step {global_step+1}: loss = {loss.item():.4f}")
                     self.writer.add_scalar('loss', loss.item(), global_step)
                     self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_step)
-                
+
                 global_step += 1
                 epoch_loss += loss.item()
                 progress_bar.set_postfix(loss=loss.item())
-                
+
                 if global_step % save_step == 0:
                     self.save_checkpoint(global_step)
-                    self.writer.add_figure("mel/target", plot_spectrogram(mel_spec[0,:,:].detach().cpu().numpy()), global_step)
-                    self.writer.add_figure("mel/mask", plot_spectrogram(cond[0,:,:].detach().cpu().numpy()), global_step)
-                    self.writer.add_figure("mel/prediction", plot_spectrogram(pred[0,:,:].detach().cpu().numpy()), global_step)
-            
+                    if self.is_main:
+                        self.writer.add_figure("mel/target", plot_spectrogram(mel_spec[0,:,:].detach().cpu().numpy()), global_step)
+                        self.writer.add_figure("mel/mask", plot_spectrogram(cond[0,:,:].detach().cpu().numpy()), global_step)
+                        self.writer.add_figure("mel/prediction", plot_spectrogram(pred[0,:,:].detach().cpu().numpy()), global_step)
+
             epoch_loss /= len(train_dataloader)
-            if self.accelerator.is_local_main_process:
+            if self.is_main:
                 logger.info(f"epoch {epoch+1}/{epochs} - average loss = {epoch_loss:.4f}")
                 self.writer.add_scalar('epoch average loss', epoch_loss, epoch)
-        
-        self.writer.close()
+
+        if self.is_main:
+            self.writer.close()
