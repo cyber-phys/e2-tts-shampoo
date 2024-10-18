@@ -143,7 +143,7 @@ def get_g2p_en_encode():
 
         phonemes = [g2p(t) for t in text]
         list_tensors = [tensor([phoneme_to_index[p] for p in one_phoneme]) for one_phoneme in phonemes]
-        padded_tensor = pad_sequence(list_tensors, padding_value = -1)
+        padded_tensor = pad_sequence(list_tensors, padding_value = -1, batch_first = True)
         return padded_tensor
 
     return encode, (num_phonemes + num_extended_chars)
@@ -169,7 +169,7 @@ def mask_from_start_end_indices(
     start: Int['b'],
     end: Int['b']
 ):
-    max_seq_len = seq_len.max().item()  
+    max_seq_len = seq_len.max().item()
     seq = torch.arange(max_seq_len, device = start.device).long()
     return einx.greater_equal('n, b -> b n', seq, start) & einx.less('n, b -> b n', seq, end)
 
@@ -932,7 +932,7 @@ class E2TTS(Module):
 
         self.mel_spec = default(mel_spec_module, MelSpec(**mel_spec_kwargs))
         num_channels = default(num_channels, self.mel_spec.n_mel_channels)
- 
+
         self.num_channels = num_channels
         self.sampling_rate = default(sampling_rate, getattr(self.mel_spec, 'sampling_rate', None))
 
@@ -1040,7 +1040,7 @@ class E2TTS(Module):
         keep_parallel_frac: float = 0.,
         **kwargs,
     ):
-        
+
         pred = self.transformer_with_pred_head(*args, drop_text_cond = False, **kwargs)
 
         if cfg_strength < 1e-5:
